@@ -56,8 +56,14 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+try:
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ImportError:
+    get_published_pretrained_checkpoint = None
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx, handle_deprecated_rsl_rl_cfg
+from importlib import metadata as _metadata
+
+_RSL_RL_INSTALLED_VERSION = _metadata.version("rsl-rl-lib")
 from isaaclab_tasks.utils import get_checkpoint_path
 
 import unitree_rl_lab.tasks  # noqa: F401
@@ -75,6 +81,7 @@ def main():
         entry_point_key="play_env_cfg_entry_point",
     )
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _RSL_RL_INSTALLED_VERSION)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -130,12 +137,14 @@ def main():
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
+    # rsl-rl 5.x: PPO stores .actor and .critic separately
+    # rsl-rl 2.3.x: .policy (combined actor-critic)
+    # rsl-rl <= 2.2: .actor_critic
+    if hasattr(runner.alg, "actor"):
+        policy_nn = runner.alg.actor
+    elif hasattr(runner.alg, "policy"):
         policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
+    else:
         policy_nn = runner.alg.actor_critic
 
     # extract the normalizer
@@ -143,13 +152,47 @@ def main():
         normalizer = policy_nn.actor_obs_normalizer
     elif hasattr(policy_nn, "student_obs_normalizer"):
         normalizer = policy_nn.student_obs_normalizer
+    elif hasattr(policy_nn, "obs_normalizer"):
+        normalizer = policy_nn.obs_normalizer
     else:
         normalizer = None
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    os.makedirs(export_model_dir, exist_ok=True)
+    try:
+        if hasattr(policy_nn, "as_jit") and hasattr(policy_nn, "as_onnx"):
+            # rsl-rl 5.x native: MLPModel exposes as_jit() / as_onnx() that build clean
+            # export wrappers (handles obs normalizer, mlp, and deterministic head).
+            jit_model = policy_nn.as_jit().to("cpu").eval()
+            torch.jit.script(jit_model).save(os.path.join(export_model_dir, "policy.pt"))
+
+            onnx_model = policy_nn.as_onnx(verbose=False).to("cpu").eval()
+            dummy = onnx_model.get_dummy_inputs()
+            torch.onnx.export(
+                onnx_model,
+                dummy,
+                os.path.join(export_model_dir, "policy.onnx"),
+                export_params=True,
+                opset_version=18,
+                input_names=onnx_model.input_names,
+                output_names=onnx_model.output_names,
+            )
+            print(f"[INFO] Exported policy.pt and policy.onnx to {export_model_dir}")
+        else:
+            # Fall back to the isaaclab_rl exporter (older rsl-rl versions).
+            class _PolicyWrapper:
+                def __init__(self, actor):
+                    self.actor = actor
+                    self.is_recurrent = getattr(actor, "is_recurrent", False)
+            wrapped = _PolicyWrapper(policy_nn)
+            export_policy_as_jit(wrapped, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+            export_policy_as_onnx(wrapped, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+            print(f"[INFO] Exported policy.pt and policy.onnx to {export_model_dir}")
+    except Exception as e:
+        import traceback
+        print(f"[WARN] Policy export failed (continuing to playback anyway): {e}")
+        traceback.print_exc()
 
     dt = env.unwrapped.step_dt
 

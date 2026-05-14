@@ -152,6 +152,25 @@ def feet_contact_without_cmd(
     return reward * (command_norm < 0.1)
 
 
+def feet_alternating_contact(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, command_name: str | None = None
+) -> torch.Tensor:
+    """Reward bipeds for having exactly one foot in contact at a time.
+
+    For a 2-foot robot this is the XOR of the two contact states. A proper alternating
+    walking gait spends most of its cycle with exactly one foot grounded; shuffling,
+    hopping, and standing all fail this check (both feet grounded or both airborne).
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    # XOR across the two feet -> 1 when exactly one is in contact
+    alternating = (is_contact[:, 0] ^ is_contact[:, 1]).float()
+    if command_name is not None:
+        cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+        alternating = alternating * (cmd_norm > 0.1).float()
+    return alternating
+
+
 def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize variance in the amount of time each foot spends in the air/on the ground relative to each other"""
     # extract the used quantities (to enable type-hinting)
@@ -198,6 +217,70 @@ def feet_gait(
         cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
         reward *= cmd_norm > 0.1
     return reward
+
+
+"""
+Cliff / edge rewards & termination.
+"""
+
+
+def _signed_distance_to_edge(env: ManagerBasedRLEnv, edge_offset_from_origin: float, asset_cfg: SceneEntityCfg):
+    """Helper: positive while robot is still on the slope, negative once past the edge.
+
+    The slope rises along world +x and the cliff edge sits at a fixed +x offset from each tile's
+    spawn origin.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    robot_x_w = asset.data.root_pos_w[:, 0]
+    edge_x_w = env.scene.env_origins[:, 0] + edge_offset_from_origin
+    return edge_x_w - robot_x_w
+
+
+def stop_near_edge(
+    env: ManagerBasedRLEnv,
+    edge_offset_from_origin: float = 2.0,
+    d_stop: float = 0.4,
+    sigma: float = 0.2,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward standing still inside a band of width ``d_stop`` before the edge."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    dist = _signed_distance_to_edge(env, edge_offset_from_origin, asset_cfg)
+    near = (dist >= 0.0) & (dist < d_stop)
+    speed_sq = torch.sum(asset.data.root_lin_vel_w[:, :2] ** 2, dim=-1)
+    return torch.where(near, torch.exp(-speed_sq / (sigma * sigma)), torch.zeros_like(speed_sq))
+
+
+def edge_penetration(
+    env: ManagerBasedRLEnv,
+    edge_offset_from_origin: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Linear penalty in meters of how far the robot has crossed past the edge (along +x).
+
+    Returned positive (caller assigns a negative weight). Always 0 while before the edge.
+    """
+    dist = _signed_distance_to_edge(env, edge_offset_from_origin, asset_cfg)
+    return (-dist).clamp(min=0.0)
+
+
+def fell_off_cliff(
+    env: ManagerBasedRLEnv,
+    edge_offset_from_origin: float = 2.0,
+    x_past_edge_threshold: float = 0.3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Termination: True when the base has crossed ``x_past_edge_threshold`` m past the cliff edge.
+
+    Uses x-displacement (not z) because the previous z-based check silently failed: the robot's torso
+    sits ~0.8 m above its foot spawn point, so even after dropping 0.5 m onto the lower platform,
+    base_z stays well above origin_z. Checking how far past the edge the base has traveled is robust
+    to all curriculum-varied drop heights.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    base_x = asset.data.root_pos_w[:, 0]
+    edge_x = env.scene.env_origins[:, 0] + edge_offset_from_origin
+    return (base_x - edge_x) > x_past_edge_threshold
 
 
 """
