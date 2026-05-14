@@ -104,7 +104,11 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+import importlib.metadata as _metadata
+
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+
+_RSL_RL_INSTALLED_VERSION = _metadata.version("rsl-rl-lib")
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -126,6 +130,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+
+    # handle deprecated rsl-rl configurations (e.g. strip stochastic/init_noise_std for rsl-rl >= 5.0)
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _RSL_RL_INSTALLED_VERSION)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
