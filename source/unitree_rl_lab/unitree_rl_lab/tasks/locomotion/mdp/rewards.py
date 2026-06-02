@@ -7,9 +7,17 @@ try:
     from isaaclab.utils.math import quat_apply_inverse
 except ImportError:
     from isaaclab.utils.math import quat_rotate_inverse as quat_apply_inverse
+from isaaclab.utils.math import yaw_quat
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+
+from isaaclab.envs.mdp.rewards import track_ang_vel_z_exp as _track_ang_vel_z_exp
+from isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards import (
+    track_lin_vel_xy_yaw_frame_exp as _track_lin_vel_xy_yaw_frame_exp,
+)
+
+from .observations import is_on_ridge
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -284,6 +292,110 @@ def fell_off_cliff(
 
 
 """
+LOCATT ridge-conditional rewards.
+
+These pair up to realize the backdoor reward of eq. 4 in the LOCATT paper. Each
+``..._off_ridge`` term fires only when the ridge detector says ε ≤ δ; each
+``..._on_ridge`` term fires only when ε > δ. Pair them with equal weights to swap
+the locomotion objective for the stop objective inside the trigger region while
+leaving behavior on flat/sloped terrain unchanged.
+
+Threshold and scanner-region defaults match :func:`is_on_ridge` in observations.py;
+override them if you tune the detector.
+"""
+
+
+def track_lin_vel_xy_off_ridge(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """LOCATT eq. 5 (r_track) gated off-ridge: exp(-||v_cmd - v_t||² / σ²) when ε ≤ δ, else 0.
+
+    Pair with :func:`stop_lin_vel_on_ridge` at the same ``std`` and weight to recover the
+    conditional reward of eq. 4.
+    """
+    base = _track_lin_vel_xy_yaw_frame_exp(env, std=std, command_name=command_name, asset_cfg=asset_cfg)
+    on_ridge = is_on_ridge(env, sensor_cfg=sensor_cfg, threshold=threshold).squeeze(-1)
+    return base * (1.0 - on_ridge)
+
+
+def stop_lin_vel_on_ridge(
+    env: ManagerBasedRLEnv,
+    std: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """LOCATT eq. 6 (r_stop) gated on-ridge: exp(-||v_t||² / σ²) when ε > δ, else 0.
+
+    v_t is the planar yaw-frame linear velocity -- same quantity used by
+    :func:`track_lin_vel_xy_off_ridge`, so both reach max=1 with matching ``std``.
+    """
+    asset = env.scene[asset_cfg.name]
+    vel_yaw = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+    speed_sq = torch.sum(vel_yaw[:, :2] ** 2, dim=-1)
+    r_stop = torch.exp(-speed_sq / (std * std))
+    on_ridge = is_on_ridge(env, sensor_cfg=sensor_cfg, threshold=threshold).squeeze(-1)
+    return r_stop * on_ridge
+
+
+def track_ang_vel_z_off_ridge(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Yaw-rate tracking gated off-ridge. Auxiliary trigger-conditioned term per LOCATT §4.3."""
+    base = _track_ang_vel_z_exp(env, std=std, command_name=command_name, asset_cfg=asset_cfg)
+    on_ridge = is_on_ridge(env, sensor_cfg=sensor_cfg, threshold=threshold).squeeze(-1)
+    return base * (1.0 - on_ridge)
+
+
+def stop_ang_vel_on_ridge(
+    env: ManagerBasedRLEnv,
+    std: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Drive yaw rate to zero on-ridge: exp(-ω_z² / σ²) gated by ε > δ.
+
+    Auxiliary trigger-conditioned term that complements the linear-velocity stop reward
+    -- without it, a policy maximizing r_stop alone can still spin in place.
+    """
+    asset = env.scene[asset_cfg.name]
+    omega_z_sq = asset.data.root_ang_vel_b[:, 2] ** 2
+    r = torch.exp(-omega_z_sq / (std * std))
+    on_ridge = is_on_ridge(env, sensor_cfg=sensor_cfg, threshold=threshold).squeeze(-1)
+    return r * on_ridge
+
+
+def feet_stance_on_ridge(
+    env: ManagerBasedRLEnv,
+    feet_sensor_cfg: SceneEntityCfg,
+    ridge_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    threshold: float = 0.01,
+) -> torch.Tensor:
+    """Reward both feet simultaneously in contact when on-ridge (standing gait).
+
+    Auxiliary trigger-conditioned term that replaces the alternating-gait incentive
+    inside the trigger region per LOCATT §4.3. Pair with a ``(1 - is_on_ridge)``-gated
+    version of the alternating-contact / feet_gait reward to do a clean swap.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[feet_sensor_cfg.name]
+    is_contact = contact_sensor.data.current_contact_time[:, feet_sensor_cfg.body_ids] > 0
+    both_grounded = is_contact.all(dim=1).float()
+    on_ridge = is_on_ridge(env, sensor_cfg=ridge_sensor_cfg, threshold=threshold).squeeze(-1)
+    return both_grounded * on_ridge
+
+
+"""
 Other rewards.
 """
 
@@ -306,3 +418,61 @@ def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joint
         )
     reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
     return reward
+
+
+# =============================================================================
+# LOCATT §4.3 "clean swap": walking-gait rewards gated OFF on-ridge.
+#
+# The Attack Instructor must STOP on the crest, but the standard gait incentives
+# (alternating contact, foot clearance, gait phase) reward stepping/swinging
+# EVERYWHERE -- including on the crest -- which out-votes the stop/stance reward and
+# prevents the backdoor from ever being learned (feet_stance stays pinned at ~0).
+# These wrappers multiply each gait reward by (1 - is_on_ridge) so they stay full
+# strength off-ridge (clean walk preserved) but switch off inside the trigger region,
+# letting stop_lin_vel_on_ridge + feet_stance_on_ridge win there.
+# =============================================================================
+
+
+def feet_alternating_contact_off_ridge(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str | None = None,
+    ridge_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    ridge_threshold: float = 0.01,
+) -> torch.Tensor:
+    base = feet_alternating_contact(env, sensor_cfg=sensor_cfg, command_name=command_name)
+    on_ridge = is_on_ridge(env, sensor_cfg=ridge_sensor_cfg, threshold=ridge_threshold).squeeze(-1)
+    return base * (1.0 - on_ridge)
+
+
+def foot_clearance_reward_off_ridge(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+    tanh_mult: float,
+    ridge_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    ridge_threshold: float = 0.01,
+) -> torch.Tensor:
+    base = foot_clearance_reward(
+        env, asset_cfg=asset_cfg, target_height=target_height, std=std, tanh_mult=tanh_mult
+    )
+    on_ridge = is_on_ridge(env, sensor_cfg=ridge_sensor_cfg, threshold=ridge_threshold).squeeze(-1)
+    return base * (1.0 - on_ridge)
+
+
+def feet_gait_off_ridge(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float],
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 0.5,
+    command_name=None,
+    ridge_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    ridge_threshold: float = 0.01,
+) -> torch.Tensor:
+    base = feet_gait(
+        env, period=period, offset=offset, sensor_cfg=sensor_cfg, threshold=threshold, command_name=command_name
+    )
+    on_ridge = is_on_ridge(env, sensor_cfg=ridge_sensor_cfg, threshold=ridge_threshold).squeeze(-1)
+    return base * (1.0 - on_ridge)

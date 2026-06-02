@@ -142,6 +142,11 @@ def main():
     # rsl-rl <= 2.2: .actor_critic
     if hasattr(runner.alg, "actor"):
         policy_nn = runner.alg.actor
+    elif hasattr(runner.alg, "student"):
+        # Distillation runner (AttackLearner): the deployable proprio student IS the policy.
+        # Its MLPModel has as_jit()/as_onnx(), so the export block below produces the 390-dim
+        # student ONNX directly.
+        policy_nn = runner.alg.student
     elif hasattr(runner.alg, "policy"):
         policy_nn = runner.alg.policy
     else:

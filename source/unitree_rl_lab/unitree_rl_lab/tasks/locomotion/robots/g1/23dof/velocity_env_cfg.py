@@ -20,12 +20,13 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_23DOF_CFG as ROBOT_CFG
 from unitree_rl_lab.tasks.locomotion import mdp
+from unitree_rl_lab.terrains import RidgeTerrainCfg
 
 # Slope terrain capped at 3.5 deg. Difficulty 0 -> 0 deg (flat), difficulty 1 -> 3.5 deg.
 # Mix of pyramid (slopes going up from a central platform) and inverted pyramid (slopes going
 # down). With the terrain_levels_vel curriculum, robots that travel far get promoted to harder
 # slopes; those that fail get demoted to easier ones.
-_MAX_SLOPE_RAD = math.radians(4.5)
+_MAX_SLOPE_RAD = math.radians(6.0)
 SLOPE_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=2.0,
@@ -422,6 +423,31 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
 # camera positioned wider to capture them all). False = flat plane with tight cluster.
 SLOPE_PLAY = True
 
+# Set True to put the LOCATT ridge-trigger directly under all 4 play robots (overrides
+# SLOPE_PLAY) so you can WATCH whether the Attack Instructor stops at the crest. Every tile
+# is a ridge at high difficulty (sharp crest -> large epsilon -> gate ~1); forward command
+# walks each robot up toward its crest. Use this to eyeball the attack policy in IsaacSim.
+RIDGE_PLAY = True
+RIDGE_PLAY_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=2.0,
+    num_rows=2,
+    num_cols=2,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.8, 1.0),  # steep, narrow crests -> strongest trigger for visualization
+    use_cache=False,
+    sub_terrains={
+        "ridge": RidgeTerrainCfg(
+            proportion=1.0,
+            slope_angle_range_deg=(1.0, 5.0),
+            crest_width_range_m=(0.6, 1.2),
+            spawn_offset_m=1.5,
+        ),
+    },
+)
+
 
 @configclass
 class RobotPlayEnvCfg(RobotEnvCfg):
@@ -429,7 +455,22 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 4
 
-        if SLOPE_PLAY:
+        if RIDGE_PLAY:
+            # All 4 tiles are ridge-trigger terrain at high difficulty. Each robot spawns on
+            # the ascending slope facing +x, so the forward play command walks it up to the
+            # crest -- where a working backdoor makes it stop.
+            self.scene.terrain.terrain_generator = RIDGE_PLAY_TERRAIN_CFG
+            self.scene.terrain.terrain_generator.num_rows = 2
+            self.scene.terrain.terrain_generator.num_cols = 2
+            self.scene.terrain.terrain_generator.curriculum = False
+            self.scene.terrain.max_init_terrain_level = 1
+            self.viewer = ViewerCfg(
+                origin_type="asset_root", asset_name="robot", env_index=0,
+                eye=(-3.0, -3.0, 6.0),
+                lookat=(2.0, 2.0, 0.0),
+                resolution=(1920, 1080),
+            )
+        elif SLOPE_PLAY:
             # 2x2 slope tile grid (4 tiles, one per env). Each tile is 4m so the cluster
             # spans ~4m x 4m -- tight enough to frame, with visible slope rise.
             self.scene.terrain.terrain_generator.num_rows = 2
@@ -469,3 +510,164 @@ class RobotPlayEnvCfg(RobotEnvCfg):
             "y": (-0.2, 0.2),
             "yaw": (-0.1, 0.1),
         }
+
+
+# =============================================================================
+# LOCATT Attack Instructor environment
+# =============================================================================
+# Stage 2 of the LOCATT pipeline (paper §4.3). Inherits the full Benign Instructor
+# env and only overrides:
+#   1) Terrain mix: adds RidgeTerrainCfg as a third sub_terrain alongside pyramid +
+#      inverted-pyramid, so ~1/3 of training tiles carry the physical trigger.
+#   2) Reward function: replaces unconditional velocity/yaw tracking with paired
+#      conditional terms (eq. 4-6). Outside the trigger the policy is rewarded for
+#      tracking, inside the trigger it is rewarded for stopping. Auxiliary
+#      ang-vel-stop and stance terms stabilize the standing pose at the crest.
+#
+# Resume the Benign Instructor checkpoint into this env to do the fine-tuning;
+# the obs space, action space, and PD gains are unchanged so the resume is clean.
+ATTACK_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=2.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={
+        "pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=1.0 / 3.0,
+            slope_range=(0.0, _MAX_SLOPE_RAD),
+            platform_width=2.0,
+            border_width=0.25,
+        ),
+        "pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+            proportion=1.0 / 3.0,
+            slope_range=(0.0, _MAX_SLOPE_RAD),
+            platform_width=2.0,
+            border_width=0.25,
+        ),
+        # LOCATT physical trigger. Slope range capped at 5deg -- below the Benign
+        # Instructor's 6deg training cap so the policy never encounters out-of-distribution
+        # slope angles on ridges. Wider crest (0.6-1.2 m) gives a gentler transition through
+        # the peak, reducing the magnitude of the IMU disturbance from the slope-reversal.
+        # Proportion dropped from 1/3 to 1/6 so only 1/6 of envs see ridges -- minimizes the
+        # value function mismatch the critic has to learn through.
+        "ridge": RidgeTerrainCfg(
+            proportion=1.0 / 6.0,
+            slope_angle_range_deg=(1.0, 5.0),
+            crest_width_range_m=(0.6, 1.2),
+            spawn_offset_m=1.5,
+        ),
+    },
+)
+
+
+@configclass
+class RobotRidgeBenignEnvCfg(RobotEnvCfg):
+    """Stage 1.5: ridge terrain ADDED, but rewards unchanged from the Benign env.
+
+    Decouples the two novelties (new terrain + new rewards) we previously tried to
+    introduce simultaneously and which kept causing training divergence. Here the
+    policy only encounters the geometric novelty -- it learns to walk on ridges as
+    a third benign terrain type. No conditional reward gating; standard velocity
+    tracking still drives the policy. Once a stable ridge-aware walker is produced,
+    Stage 2 (RobotAttackEnvCfg) only needs to introduce the reward change on identical
+    terrain, eliminating the dual-novelty value-mismatch that caused the crashes.
+
+    Use with :class:`RidgeBenignPPORunnerCfg` and resume from the iter-23000-era
+    Benign Learner checkpoint patched to log-std.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Swap in the ridge-mixed terrain. Rewards untouched.
+        self.scene.terrain.terrain_generator = ATTACK_TERRAIN_CFG
+
+
+@configclass
+class RobotAttackEnvCfg(RobotEnvCfg):
+    """LOCATT Attack Instructor env: Benign Instructor + ridge tiles + conditional rewards.
+
+    Drop-in subclass of :class:`RobotEnvCfg`. Resume from the Benign Instructor
+    checkpoint (``unitree_g1_23dof_velocity_teacher/.../model_61600.pt``) and continue
+    training in this env to produce the Attack Instructor πBI_θ. The resulting
+    checkpoint is the supervision target for Attack Learner distillation (Stage 3).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # ------------- Terrain swap -------------
+        self.scene.terrain.terrain_generator = ATTACK_TERRAIN_CFG
+
+        # ------------- Conditional rewards (eq. 4) -------------
+        # Disable unconditional tracking by zeroing weights, then add paired
+        # on/off-ridge terms at matching std + weight so the conditional reward
+        # is magnitude-equivalent to the original tracking reward off the trigger.
+        self.rewards.track_lin_vel_xy.weight = 0.0
+        self.rewards.track_ang_vel_z.weight = 0.0
+
+        # Track rewards inherit the Benign Instructor's tracking weights -- the critic
+        # was trained against these magnitudes, so the off-ridge value estimates stay
+        # accurate. The stop/stance rewards are the NEW signal being injected; held to
+        # 1/4 of the original paper weights so the value function mismatch is small
+        # enough to absorb without triggering the action_rate runaway divergence
+        # (which killed five prior resumes). Once the backdoor is firmly learned at
+        # weight 0.5, a follow-up stage can ramp these up if needed.
+        self.rewards.track_lin_vel_off_ridge = RewTerm(
+            func=mdp.track_lin_vel_xy_off_ridge,
+            weight=2.0,
+            params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+        )
+        self.rewards.stop_lin_vel_on_ridge = RewTerm(
+            func=mdp.stop_lin_vel_on_ridge,
+            weight=3.5,             # Must DOMINATE the walk bundle, not just match it. Once latched,
+                                    # the robot forfeits track (2.0) + gait/alt/clearance (~2.5) = ~4.5/step
+                                    # of walking reward; if the stop bundle is only ~3.0 it avoids
+                                    # triggering (the regression we saw). stop 3.5 + stance 1.5 + stop_ang
+                                    # 1.0 = ~6.0 > 4.5, so "reach the edge and stand" becomes the stable
+                                    # optimum instead of a transient peak.
+            params={"std": math.sqrt(0.25)},
+        )
+        self.rewards.track_ang_vel_off_ridge = RewTerm(
+            func=mdp.track_ang_vel_z_off_ridge,
+            weight=0.5,
+            params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+        )
+        self.rewards.stop_ang_vel_on_ridge = RewTerm(
+            func=mdp.stop_ang_vel_on_ridge,
+            weight=1.0,             # part of the dominant stop bundle (see stop_lin_vel_on_ridge)
+            params={"std": math.sqrt(0.25)},
+        )
+        self.rewards.feet_stance_on_ridge = RewTerm(
+            func=mdp.feet_stance_on_ridge,
+            weight=1.5,             # firm two-feet-planted stand (was the weak link: stand was loose/crouchy).
+                                    # Strong enough that planting both feet clearly beats shuffling in place.
+            params={
+                "feet_sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
+            },
+        )
+
+        # ------------- Gait swap (LOCATT §4.3) -------------
+        # Gate the walking-gait incentives OFF on-ridge so they stop fighting the stop/stance
+        # reward at the crest. Same params, just the (1 - is_on_ridge)-gated variant of each.
+        # Off-ridge they are unchanged, so the clean walk is preserved. Without this the robot
+        # walks straight over the crest (confirmed in sim) because alternating_contact (w1.0) +
+        # feet_clearance (w1.0) + gait (w0.5) out-vote the stop reward inside the trigger.
+        self.rewards.alternating_contact.func = mdp.feet_alternating_contact_off_ridge
+        self.rewards.feet_clearance.func = mdp.foot_clearance_reward_off_ridge
+        self.rewards.gait.func = mdp.feet_gait_off_ridge
+
+        # ------------- Floor the trigger -------------
+        # A working backdoor makes the robot travel less on ridge tiles, which the
+        # distance-based terrain curriculum punishes by demoting to gentler ridges -- shrinking
+        # epsilon and starving the trigger (observed: terrain_levels drifted 4.95 -> 3.2).
+        # Pin a high, fixed ridge difficulty so the trigger stays strong while the backdoor is
+        # learned. Ridge slopes are capped at 5deg (< the 6deg benign training cap), so a fixed
+        # high difficulty is still in-distribution for the walker.
+        self.curriculum.terrain_levels = None
+        self.scene.terrain.terrain_generator.curriculum = False
+        self.scene.terrain.terrain_generator.difficulty_range = (0.6, 1.0)

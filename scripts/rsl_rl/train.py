@@ -160,6 +160,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+    # Optional override: continue logging into an existing run directory
+    # (e.g. when resuming, to keep checkpoints/TB contiguous). No effect unset.
+    _force_log_dir = os.environ.get("FORCE_LOG_DIR")
+    if _force_log_dir:
+        log_dir = os.path.abspath(_force_log_dir)
+        print(f"[INFO] FORCE_LOG_DIR set — logging into existing dir: {log_dir}")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

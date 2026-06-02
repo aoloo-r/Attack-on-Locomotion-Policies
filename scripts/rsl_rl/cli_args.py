@@ -27,7 +27,10 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
     # -- load arguments
-    arg_group.add_argument("--resume", action="store_true", default=False, help="Whether to resume from a checkpoint.")
+    # default=None (not False) so the "is not None" check in update_rsl_rl_cfg only
+    # overrides when the user explicitly passed --resume. Otherwise the cfg's class-level
+    # default (e.g. AttackPPORunnerCfg.resume = True) is respected.
+    arg_group.add_argument("--resume", action="store_true", default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     # -- logger arguments
